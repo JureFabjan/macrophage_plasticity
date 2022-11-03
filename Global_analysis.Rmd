@@ -1,0 +1,401 @@
+---
+title: "Global_analysis"
+author: "Jure Fabjan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+params:
+  path0: "//NUCLEUS/bigdata/Isabelle/Global/"
+  pathout: "//NUCLEUS/bigdata/Isabelle/Global/Extra_output/"
+  human_effect: "//NUCLEUS/bigdata/NeuroDeRisk/WP2/In vitro/Annotations/Substance_effects.csv"
+  outfolder: "//NUCLEUS/bigdata/Isabelle/Global/Output/"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Prepare parameters
+```{r parameters, echo=FALSE}
+options(width=100)
+tictoc::tic()
+```
+
+```{r seed}
+set.seed(123)
+```
+
+# Load packages
+```{r packages, include=FALSE}
+library(ggplot2)
+library(stringr)
+library(sva)
+library(DESeq2)
+library(GO.db)
+library(dplyr)
+library(igraph)
+library(RCy3)
+library(ggthemes)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(clusterProfiler)
+library(pathview)
+library(tidyverse)
+library(SummarizedExperiment)
+library(goseq)
+library(AnnotationHub)
+library(reshape2)
+library(ReactomePA)
+library(dnapath)
+library(limma)
+library(biomaRt)
+```
+
+# Global parameters
+```{r global_params}
+fold_cutoff = 1
+```
+
+
+# Reading data 
+```{r data_import}
+data <- read.csv(str_c(params$path0, "rnaseq_deseq_global_counts_raw.tsv"), sep="\t")
+samples <- read.csv(str_c(params$path0,"rnaseq_deseq_global_samples.tsv"), sep="\t")
+contrasts <- read.csv(str_c(params$path0,"rnaseq_deseq_global_contrasts_summary.tsv"), sep="\t")
+gene_an <- read.csv(str_c(params$path0,"rnaseq_deseq_global_annotation_gene.tsv"), sep="\t")
+```
+
+# Formatting the metadata
+We add the processing dates to the samples. We define batches based on the dates.
+```{r metadata_date}
+samples$isolation <- ""
+samples$isolation[samples$individual %in% c("K78_17", "K9_18")] <- "19.12.2017"
+samples$isolation[samples$individual %in% c("K1_18", "K2_18")] <- "05.02.2018"
+samples$isolation[samples$individual %in% c("K11_18", "K12_18")] <- "27.02.2018"
+samples$isolation[samples$individual %in% c("K18_18", "K19_18")] <- "24.04.2018"
+samples$isolation[samples$individual %in% c("K20_18", "K21_18")] <- "25.04.2018"
+samples$isolation[samples$individual %in% c("K23_18", "K24_18")] <- "06.06.2018"
+samples$isolation[samples$individual %in% c("K34_18", "K36_18")] <- "03.12.2018"
+samples$isolation[samples$individual %in% c("K5_18")] <- "12.02.2018"
+samples$isolation[samples$individual %in% c("K57_15")] <- "16.06.2015"
+samples$isolation[samples$individual %in% c("K37_18")] <- "04.12.2018"
+samples$isolation[samples$individual %in% c("K35_18")] <- "11.12.2018"
+
+samples$batch <- match(samples$isolation, unique(samples$isolation))
+```
+
+Some samples are not paired - don't have a counterpart with a different experimental conditions. Thus, we label these samples. 
+```{r metadata_pairing}
+samples$paired <- TRUE
+samples$paired[samples$individual %in% c("K5_18", "K57_15", "K37_18", "K35_18")] <- FALSE
+```
+
+Next we remove the extra metadata columns from the data table. Before doing so we store gene IDs as row names.
+```{r data_cleaning}
+data = data %>% column_to_rownames(var="gene_id")
+subdata <- data[, !(names(data) %in% c("gene_version", "gene_name", "gene_biotype", "gene_source", "location"))]
+```
+
+
+We also mine Ensembl for gene descriptors we will need later.
+```{r ensembl}
+genes = data.frame(gene_ids = gene_an$gene_id)
+
+ensembl = useMart("ENSEMBL_MART_ENSEMBL")
+ensembl = useDataset("hsapiens_gene_ensembl", mart=ensembl)
+geneannot = getBM(attributes = c("ensembl_gene_id", "description", "entrezgene_id"),
+                  filters="ensembl_gene_id",
+                  values=genes, mart=ensembl)
+geneannot = geneannot[!duplicated(geneannot$ensembl_gene_id),]
+genes = genes %>% left_join(geneannot, by=c("gene_ids"="ensembl_gene_id"))
+gene_an = gene_an %>% left_join(genes, by=c("gene_id"="gene_ids"))
+rownames(gene_an) = gene_an$gene_id
+```
+
+
+Some of the entrez IDs were assigned to two gene IDs. We manually correct these. In the majority of cases, a wrong entrez ID was assigned to one of the duplicates, while the other is correct. In one case there is a single gene, in which case we merge the two entries by summing them up.
+```{r correcting_entrez}
+gene_an[c("ENSG00000183889", "ENSG00000233024"), "entrezgene_id"] = 105376752
+gene_an["ENSG00000170667", "entrezgene_id"] = 100271927
+gene_an[c("ENSG00000285269", "ENSG00000226266", "ENSG00000257524"), "entrezgene_id"] = NA
+gene_an["ENSG00000179304", "entrezgene_id"] = 727866
+gene_an["ENSG00000237541", "entrezgene_id"] = 3118
+gene_an["ENSG00000228696", "entrezgene_id"] = 100506084
+gene_an["ENSG00000278662", "entrezgene_id"] = 647042
+gene_an["ENSG00000278970", "entrezgene_id"] = 100859930
+gene_an["ENSG00000205571", "entrezgene_id"] = 6607
+gene_an["ENSG00000132207", "entrezgene_id"] = 548593
+gene_an["ENSG00000205572", "entrezgene_id"] = 728492
+```
+
+
+# Data filtering
+We filter out the low count genes. We adapt also the gene annotation.
+```{r filter_genes}
+data_filtered <- subdata[rowSums(subdata > 10) > 5,]
+gene_filtered_an <- gene_an[gene_an$gene_id %in% rownames(data_filtered),]
+```
+
+Next we remove the outliers. We use the subsetting function.
+```{r filter_outliers}
+subsamples <- samples[samples$individual != "K36_18",]
+data_filtered <- data_filtered[,names(data_filtered) %in% subsamples$sample]
+rownames(subsamples) <- subsamples$sample
+
+rownames(gene_filtered_an) <- gene_filtered_an$gene_id
+
+experiment <- SummarizedExperiment(assays = list(counts=as.matrix(data_filtered)),
+                                   colData = subsamples,
+                                   rowData = gene_filtered_an)
+```
+
+
+# DESeqDataSeq creation and testing
+```{r DESeq_creation}
+dds <- DESeqDataSet(experiment, design = ~ group + isolation)
+dds <- DESeq(dds, test="LRT", reduced = ~ isolation)
+```
+
+
+# Dispersion estimeation
+We need to estimate the dispersion trend and transform the data for later plotting.
+```{r vst_creation}
+vst_data <- vst(dds, blind = FALSE)
+```
+
+
+# Comparisons
+## Genotype: control cells vs X-ALD cells without myelin exposure
+### Extraction of results
+```{r genotype_results_extraction}
+res_genotype <- results(dds, alpha=0.01, contrast=c("group", "ALD_wo_myelin", "WT_wo_myelin"))
+```
+
+### Analysis of results
+We save the results.
+```{r genotype_results_saving}
+if (!dir.exists(str_c(params$outfolder, "Genotype/"))) {
+  dir.create(str_c(params$outfolder, "Genotype/"), recursive=TRUE)
+}
+results_temp = res_genotype
+results_temp$gene_name = gene_an$gene_name[match(row.names(results_temp), gene_an$gene_id)]
+results_temp$gene_biotype <- gene_an$gene_biotype[match(row.names(results_temp), gene_an$gene_id)]
+results_temp$location <- gene_an$location[match(row.names(results_temp), gene_an$gene_id)]
+
+write.csv(results_temp, file=str_c(params$outfolder, "Genotype/", "Results.csv"))
+remove(results_temp)
+```
+
+### Protein-protein interraction network
+We use cytoscape for plotting, so the program needs to run before this code block is executed.
+First we prepare the data.
+```{r genotype_results_PP_plotting_01}
+res_genotype_clean <- res_genotype[!is.na(res_genotype$log2FoldChange) & !is.na(res_genotype$padj),]
+res_genotype_clean <- res_genotype_clean[(res_genotype_clean$padj < 0.01) & (abs(res_genotype_clean$log2FoldChange) > fold_cutoff),]
+res_genotype_clean$gene <- gene_an$gene_name[match(row.names(res_genotype_clean), gene_an$gene_id)]
+res_genotype_clean$gene_id <- row.names(res_genotype_clean)
+```
+
+Next we push the data to cytoscape. We use logFC values for coloring of the nodes. In the end we save the session into the output folder.
+```{r genotype_results_PP_plotting_02}
+cytoscapePing()
+string.cmd = paste('string protein query query="', paste(res_genotype_clean$gene_id, collapse=',') , '" cutoff=0.9 species="Homo sapiens"', sep="")
+commandsRun(string.cmd)
+layoutNetwork("attribute-circle")
+deleteStyleMapping(style.name = "STRING style v1.5", visual.prop = "NODE_CUSTOMGRAPHICS_1")
+
+column <- "query term"
+values <- getTableColumns("node", column)
+values <- values[!is.na(values)]
+values <- data.frame(values=values, logFC=res_genotype_clean$log2FoldChange[match(values, res_genotype_clean$gene_id)])
+values$logFC <- res_genotype_clean$log2FoldChange[match(values$values, res_genotype_clean$gene_id)]
+
+pal <- scale_color_gradient2_tableau("Classic Red-Green", trans = "reverse")
+values$colors <- pal$palette((values$logFC-min(values$logFC))/(max(values$logFC)-min(values$logFC)))
+setNodeColorDefault('#CCCCCC', style.name = "STRING style v1.5")
+setNodeColorMapping(column, values$values, values$colors, mapping.type="d", style.name="STRING style v1.5")
+
+saveSession(str_c(params$outfolder, "Genotype/","Prot-prot_network.cys"))
+```
+
+### GO analysis
+Preparing the gene lists and testing GO.
+```{r genotype_results_GO_01}
+genes = rowData(dds)[rownames(res_genotype)[res_genotype$padj<0.05 & !is.na(res_genotype$padj)],]$entrezgene_id
+genes = genes[!is.na(genes)]
+
+genotype_GO = goana(genes, species="Hs")
+genotype_GO$P.DE_adjust = p.adjust(genotype_GO$P.DE, method="BH")
+```
+
+Saving the results.
+```{r genotype_results_GO_02}
+write.csv(genotype_GO, str_c(params$outfolder, "Genotype/", "GO_enrichment.csv"))
+```
+
+
+Plotting of GO results.
+```{r genotype_results_GO_plotting_02, echo=FALSE, message=FALSE, warning=FALSE, out.width = "100%", dpi=150}
+genotype_GO[genotype_GO$Ont == "BP",] %>%
+  top_n(20, wt=-P.DE_adjust) %>%
+  mutate(hitsPerc=DE*100/N) %>%
+  ggplot(aes(x=hitsPerc, y=Term, color=P.DE_adjust, size=N)) +
+    geom_point() +
+    expand_limits(x=0) +
+    labs(x="Hits (%)", y="GO term", color="p value", size="Count")
+```
+
+
+### KEGG
+```{r genotype_results_KEGG_01}
+genotype_KEGG = kegga(genes, species="Hs")
+genotype_KEGG$P.DE_adjust = p.adjust(genotype_KEGG$P.DE, method="BH")
+
+write.csv(genotype_KEGG, str_c(params$outfolder, "Genotype/", "KEGG_enrichment.csv"))
+```
+
+
+```{r genotype_results_KEGG_02, echo=FALSE, message=FALSE, warning=FALSE}
+entrez <- res_genotype$log2FoldChange
+names(entrez) <- rowData(dds)[rownames(res_genotype),]$entrezgene_id
+entrez <- entrez[!is.na(names(entrez))]
+
+dir.create(str_c(params$outfolder, "Genotype/", "KEGG_img"))
+
+current_dir = getwd()
+setwd(str_c(params$outfolder, "Genotype/", "KEGG_img"))
+for (pathway in row.names(genotype_KEGG[genotype_KEGG$P.DE_adjust < 0.05,])) {
+  pathview(gene.data = entrez,
+           pathway.id = strsplit(pathway, ":")[[1]][2],
+           species = "hsa")
+}
+setwd(current_dir)
+```
+
+### Looking at genes of interest
+```{r genotype_interesting_genes}
+interesting_genes <- c("LAMP3",
+                       "LAMP5",
+                       "IL36B",
+                       "IL36RN",
+                       "LEP",
+                       "CCL13",
+                       "CXCL12",
+                       "CDH1",
+                       "NOS3",
+                       "CLU",
+                       "IL2RA")
+```
+
+
+We subset the data of interest.
+```{r genotype_subsetting_data_of_interest}
+interesting_data <- assay(vst_data)[gene_filtered_an$gene_id[gene_filtered_an$gene_name %in% interesting_genes], dds$sample[dds$group %in% c("WT_wo_myelin", "ALD_wo_myelin")]]
+rownames(interesting_data) <- gene_filtered_an$gene_name[match(rownames(interesting_data), gene_filtered_an$gene_id)]
+interesting_data <- melt(interesting_data)
+colnames(interesting_data) <- c("gene_name", "sample", "value")
+interesting_data$group <- dds$group[match(interesting_data$sample, dds$sample)]
+```
+
+
+```{r genotype_interesting_genes_plot_01, echo=FALSE, message=FALSE, warning=FALSE, out.width = "100%", dpi=150}
+ggplot(interesting_data, aes(x=group, y=value, fill=paste(interesting_data$gene_name, interesting_data$group, sep=""))) +
+  geom_boxplot() +
+  facet_wrap(~gene_name, scales="free_y", shrink=FALSE) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 45, hjust=1),
+        axis.title.x = element_blank()) +
+  ylab("Variance-stabilized counts")
+```
+
+### Reactome pathways
+```{r genotype_reactome_entrez_01}
+x <- enrichPathway(gene=names(entrez), pvalueCutoff = 0.05, readable=T)
+```
+
+
+```{r genotype_reactome_plot_01, echo=FALSE, message=FALSE, warning=FALSE, out.width = "100%", dpi=150}
+dotplot(x)
+```
+
+
+### DNA pathways
+We first normalize data to TPM and then log2 transform.
+```{r genotype_transform}
+data_subset <- subdata[,samples$sample[samples$group %in% c("WT_wo_myelin", "ALD_wo_myelin")]]
+
+hub <- AnnotationHub()
+ensdb <- hub[["AH95744"]]
+txsByGene <- transcriptsBy(ensdb, by="gene")
+lengthData <- median(width(txsByGene)) / 1000
+lengthData <- lengthData[match(rownames(data_subset), names(lengthData))]
+data_subset <- data_subset / lengthData
+data_subset <- t( t(data_subset) * 1e6 / colSums(data_subset, na.rm=TRUE))
+
+data_subset <- log2(data_subset+1)
+```
+
+
+Next we remove the genes with more than 1/3 values equaling 0.
+``` {r zero_remove}
+data_subset <- data_subset[rowSums(data_subset > 0) > (length(colnames(data_subset))/3),]
+```
+
+
+We replace row names with entrez gene IDs and remove entries without it. We also prepare group data for each sample.
+``` {r dnapath_entrez}
+# Transform symbols to entrez and remove the ones that don't have it
+rownames(data_subset) = rowData(dds)[rownames(data_subset),]$entrezgene_id
+data_subset <- data_subset[!is.na(rownames(data_subset)),]
+
+```
+
+
+``` {r}
+data_subset_02 <- t(data_subset[rownames(data_subset) != "NULL",])
+
+data_subset_02 = data_subset_02[,!(duplicated(colnames(data_subset_02)))]
+
+data_groups = samples[samples$sample %in% rownames(data_subset_02), c("sample", "group")]
+data_groups$group = as.numeric(as.factor(data_groups$group))-1
+temp_samples = data_groups$sample
+data_groups = data_groups$group
+names(data_groups) = temp_samples
+
+```
+
+Next we perform the testing.
+``` {r dnapath_test, echo=FALSE}
+results <- dnapath(x = data_subset_02,
+                   pathway_list = get_reactome_pathways("Homo sapiens"),
+                   group_labels = data_groups,
+                   n_perm = 100,
+                   seed = 1,
+                   verbose = TRUE)
+```
+
+Finally, we save graphs of individual paths in PDF files.
+``` {r dnapath_plot}
+subresults <- filter_pathways(results, alpha_pathway=0.01)
+subresults_sym <- rename_genes(subresults, to = "symbol", species = "human")
+for (i in 1:length(subresults_sym)) {
+  pdf(str_c(params$outfolder, gsub(" ", "_", names(subresults_sym[[i]]), fixed=TRUE), ".pdf"))
+  plot(subresults_sym[[i]])
+  dev.off()
+}
+```
+
+# Session info
+
+```{r time}
+print(date())
+print(tictoc::toc())
+```
+
+```{r session}
+devtools::session_info()
+```
+
